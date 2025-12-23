@@ -1,10 +1,9 @@
 use chrono::prelude::*;
 use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};
+use std::error::Error; // We need this for the return type
 
-// 1. DEFining the block struct
-// we derive serialize so we can convert this struct to a json string strictly for hashing
-
+// 1. DEFINE BLOCK
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Block {
     timestamp: u64,
@@ -14,123 +13,166 @@ struct Block {
 }
 
 impl Block {
-    // constructor for a new block
     fn new(data: String, prev_hash: String) -> Self {
         let timestamp = Utc::now().timestamp_millis() as u64;
         let mut block = Block {
             timestamp,
             data,
             prev_hash,
-            hash: String::new(), // calculated below
+            hash: String::new(),
         };
         block.hash = block.calculate_hash();
         block
     }
 
-    // concept: SERIALIZATION and hashing
     fn calculate_hash(&self) -> String {
-        // we do not include the block's own hash in the input, obviously
-        // we create a tuple of the data we want to hash
-
         let input = (self.timestamp, &self.data, &self.prev_hash);
-
-        // serialize to JSON string
         let input_json = serde_json::to_string(&input).unwrap();
-
-        // hash the string
         let mut hasher = Sha256::new();
         hasher.update(input_json);
-
-        let result = hasher.finalize();
-
-        hex::encode(result)
+        hex::encode(hasher.finalize())
     }
 }
 
-
-// 2. DEFINING THE BLOCKCHAIN STRUCT
+// 2. DEFINE BLOCKCHAIN
 struct Blockchain {
-    chain: Vec<Block>,
+    db: sled::Db, 
+    current_hash: String,
 }
 
 impl Blockchain {
-    fn new() -> Self {
-        // the first block(Genesis block) has no previous hash
-        let genesis_block = Block::new("Genesis block".to_string(), "0".to_string());
-        Blockchain {
-            chain: vec![genesis_block],
+    // FIX 1: Return Result<Blockchain, ...> instead of Self
+    // This allows us to use the '?' operator inside.
+    fn new() -> Result<Blockchain, Box<dyn Error>> {
+        let db = sled::open("my_db")?;
+
+        let last_hash_bytes = db.get("LAST")?;
+
+        let current_hash = match last_hash_bytes {
+            // FIX 2: Handle the "Found" case correctly
+            Some(bytes) => {
+                // Convert bytes to String
+                String::from_utf8(bytes.to_vec())?
+            },
+            // Handle the "Not Found" (First run) case
+            None => {
+                let genesis = Block::new("Genesis Block".to_string(), "0".to_string());
+                let genesis_hash = genesis.hash.clone();
+                let genesis_json = serde_json::to_string(&genesis)?;
+
+                db.insert(genesis.hash.as_bytes(), genesis_json.as_bytes())?;
+                db.insert("LAST", genesis.hash.as_bytes())?;
+
+                genesis_hash
+            }
+        };
+        
+        // FIX 3: Wrap the return struct in Ok()
+        Ok(Blockchain { db, current_hash })
+    }
+
+    // FIX 4: Return Result<(), ...> so we can use '?'
+    fn add_block(&mut self, data: String) -> Result<(), Box<dyn Error>> {
+        let new_block = Block::new(data, self.current_hash.clone());
+        let new_hash = new_block.hash.clone();
+        let new_block_json = serde_json::to_string(&new_block)?;
+
+        self.db.insert(new_block.hash.as_bytes(), new_block_json.as_bytes())?;
+        self.db.insert("LAST", new_block.hash.as_bytes())?;
+
+        self.current_hash = new_hash;
+        self.db.flush()?; // Ensure save to disk
+
+        Ok(())
+    }
+
+    fn print_chain(&self) {
+        let mut search_hash = self.current_hash.clone();
+        println!("--- CHAIN ON DISK ---");
+
+        loop {
+            match self.db.get(search_hash.as_bytes()) {
+                Ok(Some(bytes)) => {
+                    let block_json = String::from_utf8(bytes.to_vec()).unwrap();
+                    let block: Block = serde_json::from_str(&block_json).unwrap();
+
+                    println!("Hash: {}", block.hash);
+                    println!("Data: {}", block.data);
+                    println!("Prev: {}\n", block.prev_hash);
+
+                    if block.prev_hash == "0" {
+                        break;
+                    }
+                    search_hash = block.prev_hash;
+                },
+                _ => break,
+            }
         }
     }
 
 
-    // concept: Linking
-    // we take the hash of the *last* block and use it as the prev_hash for the *new* block
-    fn add_block(&mut self, data: String) {
-        let prev_block = self.chain.last().unwrap();
-        let new_block = Block::new(data, prev_block.hash.clone());
-        self.chain.push(new_block);
-    }
+    // Returns Ok(true) if valid, Ok(false) if corrupted
+    fn is_chain_valid(&self) -> Result<bool, Box<dyn Error>> {
+        let mut search_hash = self.current_hash.clone();
+        
+        loop {
+            // 1. Get the block bytes from the DB
+            match self.db.get(search_hash.as_bytes())? {
+                Some(bytes) => {
+                    let block_json = String::from_utf8(bytes.to_vec())?;
+                    let block: Block = serde_json::from_str(&block_json)?;
 
-    // VALIDATION
-    // this loops through the chain and ensures two things
-    // the data hasn't been tampered with (recalculating hash matches stored hash)
-    // the blocks are correctly linked current.prev_hash matches previous hash
-    fn is_valid(&self) -> bool{
-        for i in 1..self.chain.len() {
-            let current_block = &self.chain[i];
-            let previous_block = &self.chain[i - 1];
+                    // CHECK 1: Data Integrity
+                    // We recalculate the hash using the data inside the block.
+                    // If the data was edited, this calculated hash won't match the stored hash.
+                    if block.hash != block.calculate_hash() {
+                        println!("ERROR: Hash mismatch for block {}", block.hash);
+                        return Ok(false);
+                    }
 
-            // check 1: Did the data inside the block chainge
-            if current_block.hash != current_block.calculate_hash() {
-                println!("block {} data tampered", i);
-                return false;
-            }
-
-            // check 2: Is the link broken
-            if current_block.prev_hash != previous_block.hash {
-                println!("block {} link broken", i);
-                return false;
+                    // CHECK 2: Link Integrity
+                    // (Implicit) We are using 'prev_hash' to find the next block. 
+                    // If this pointer is wrong, the next DB lookup will fail or return the wrong block.
+                    
+                    // Stop at Genesis
+                    if block.prev_hash == "0" {
+                        println!("Chain valid. Genesis reached.");
+                        break;
+                    }
+                    
+                    // Move backwards
+                    search_hash = block.prev_hash;
+                },
+                None => {
+                    // We were looking for a block that should exist (because a prev_hash pointed to it)
+                    // but we couldn't find it. The chain is broken.
+                    println!("ERROR: Broken link! Could not find block: {}", search_hash);
+                    return Ok(false);
+                }
             }
         }
-
-        true
+        
+        Ok(true)
     }
 }
 
-
 fn main() {
-    let mut ledger = Blockchain::new();
+    // We unwrap here because if the DB fails to load, we want to crash and see why.
+    let mut chain = Blockchain::new().unwrap();
+    println!("Blockchain loaded. Current tip: {}", chain.current_hash);
 
-    // add legitimate blocks
-    println!("Mining block 1...");
-    ledger.add_block("Transaction: Alice pays bob 5 Btc".to_string());
-
-    println!("Mining block 2...");
-    ledger.add_block("Transaction: Bob pays charlie 2 btc".to_string());
-
-
-    // print the ledger
-    println!("\n current ledger");
-    for block in &ledger.chain {
-        println!("hash {} prev {} data {}", block.hash, block.prev_hash, block.data);
+    // 1. Check validity on load
+    match chain.is_chain_valid() {
+        Ok(true) => println!("Integrity check passed: ✅"),
+        Ok(false) => {
+            println!("Integrity check failed: ❌");
+            return; // Stop the program if the DB is corrupted
+        }, 
+        Err(e) => println!("Error during validation: {}", e),
     }
 
-    println!("\nIs blockchain valid? {}", ledger.is_valid());
-
-    println!("---------------------------------------");
-    println!("TAMPERING ATTACK IN PROGRESS...");
-    println!("---------------------------------------");
-
-
-    // attack: change the data in the second block
-    // we use mutable access to the chain to simulate a database hack
-    ledger.chain[1].data = "Transaction: Alice pays bob 1000 BTC".to_string();
-
-    println!("\nis blockchain valid? {}\n", ledger.is_valid());
-
-    // even if the attacker is smart and recalculates the hash for that block
-    ledger.chain[1].hash = ledger.chain[1].calculate_hash();
-    println!("attacker recalculated hash ...");
-
-    println!("is blockchain valid? {}", ledger.is_valid());
+    // 2. Add a new block
+    chain.add_block("Transaction: User A -> User B".to_string()).unwrap();
+    println!("Added new block.");
+    chain.print_chain();
 }
